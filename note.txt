@@ -1,0 +1,225 @@
+
+
+// use solana_mev_bot::{
+//     chain::{
+//         refresh::initialize_pool_data,
+//         transaction::build_and_send_transaction,
+//     },
+//     config::Config,
+// };
+// use solana_client::rpc_client::RpcClient;
+// use solana_sdk::signature::Keypair;
+// use solana_sdk::signer::Signer;
+// use std::sync::Arc;
+// use tracing::{debug, error, info};
+// use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+// #[tokio::main]
+// async fn main() {
+//     let subscriber = FmtSubscriber::builder()
+//         .with_env_filter(EnvFilter::from_default_env())
+//         .with_line_number(true)
+//         .finish();
+//     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+//     // Load configuration from environment variables
+//     let config = match Config::load() {
+//         Ok(config) => config,
+//         Err(e) => {
+//             eprintln!("Failed to load configuration: {}", e);
+//             return;
+//         }
+//     };
+
+//     println!("Configuration loaded successfully!");
+//     println!("RPC URL: {}", config.rpc.url);
+//     println!("Compute unit limit: {}", config.bot.compute_unit_limit);
+
+//     // Validate and parse wallet private key
+//     if config.wallet.private_key.is_empty() {
+//         eprintln!("Error: WALLET_PRIVATE_KEY is not set in .env file");
+//         eprintln!("Please set WALLET_PRIVATE_KEY to your wallet's private key (base58 encoded string)");
+//         return;
+//     }
+
+//     // Validate base58 encoding first
+//     if bs58::decode(&config.wallet.private_key).into_vec().is_err() {
+//         eprintln!("Error: WALLET_PRIVATE_KEY is not valid base58 encoded");
+//         eprintln!("Please ensure WALLET_PRIVATE_KEY is a valid base58 encoded private key");
+//         return;
+//     }
+
+//     // from_base58_string panics on invalid input, so we catch it
+//     let wallet_keypair = match std::panic::catch_unwind(|| {
+//         Keypair::from_base58_string(&config.wallet.private_key)
+//     }) {
+//         Ok(keypair) => keypair,
+//         Err(_) => {
+//             eprintln!("Error: Failed to parse wallet private key");
+//             eprintln!("The private key format is invalid. Expected a base58-encoded keypair (64 bytes) or secret key (32 bytes)");
+//             eprintln!("Please check your WALLET_PRIVATE_KEY in the .env file");
+//             return;
+//         }
+//     };
+    
+//     let wallet_address = wallet_keypair.pubkey().to_string();
+//     println!("Wallet address: {}", wallet_address);
+
+//     // Initialize RPC clients
+//     let main_rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
+    
+//     // Prepare RPC clients for transaction sending (spam mode or single RPC)
+//     let rpc_clients: Vec<Arc<RpcClient>> = if let Some(spam_config) = &config.spam {
+//         if spam_config.enabled && !spam_config.sending_rpc_urls.is_empty() {
+//             spam_config
+//                 .sending_rpc_urls
+//                 .iter()
+//                 .map(|url| Arc::new(RpcClient::new(url.clone())))
+//                 .collect()
+//         } else {
+//             vec![main_rpc_client.clone()]
+//         }
+//     } else {
+//         vec![main_rpc_client.clone()]
+//     };
+
+//     info!("Using {} RPC client(s) for transaction sending", rpc_clients.len());
+
+//     // Check if any mints are configured
+//     if config.routing.mint_config_list.is_empty() {
+//         eprintln!("Error: No mint configurations found");
+//         eprintln!("Please set MINT_1 and at least one pool list in your .env file");
+//         return;
+//     }
+
+//     // Spawn a trading task for each mint configuration
+//     let mut handles = vec![];
+//     let config_clone = config.clone();
+//     // Wrap keypair in Arc to share across tasks
+//     let wallet_keypair_arc = Arc::new(wallet_keypair);
+
+//     for mint_config in &config.routing.mint_config_list {
+//         // Clone all necessary data before moving into async task
+//         let mint = mint_config.mint.clone();
+//         let wallet_kp = wallet_keypair_arc.clone();
+//         let config_for_task = config_clone.clone();
+//         let rpc_clients_for_task = rpc_clients.clone();
+//         let main_rpc_for_task = main_rpc_client.clone();
+//         let process_delay = mint_config.process_delay;
+//         let wallet_addr = wallet_address.clone();
+        
+//         // Clone pool lists
+//         let raydium_pools = mint_config.raydium_pool_list.clone();
+//         let raydium_cp_pools = mint_config.raydium_cp_pool_list.clone();
+//         let pump_pools = mint_config.pump_pool_list.clone();
+//         let dlmm_pools = mint_config.meteora_dlmm_pool_list.clone();
+//         let whirlpool_pools = mint_config.whirlpool_pool_list.clone();
+//         let raydium_clmm_pools = mint_config.raydium_clmm_pool_list.clone();
+//         let meteora_damm_pools = mint_config.meteora_damm_pool_list.clone();
+//         let solfi_pools = mint_config.solfi_pool_list.clone();
+//         let meteora_damm_v2_pools = mint_config.meteora_damm_v2_pool_list.clone();
+//         let vertigo_pools = mint_config.vertigo_pool_list.clone();
+
+//         info!("Spawning trading task for mint: {}", mint);
+
+//         let handle = tokio::spawn(async move {
+//             // Initialize pool data
+//             info!("Initializing pool data for mint: {}", mint);
+//             let pool_data = match initialize_pool_data(
+//                 &mint,
+//                 &wallet_addr,
+//                 raydium_pools.as_ref(),
+//                 raydium_cp_pools.as_ref(),
+//                 pump_pools.as_ref(),
+//                 dlmm_pools.as_ref(),
+//                 whirlpool_pools.as_ref(),
+//                 raydium_clmm_pools.as_ref(),
+//                 meteora_damm_pools.as_ref(),
+//                 solfi_pools.as_ref(),
+//                 meteora_damm_v2_pools.as_ref(),
+//                 vertigo_pools.as_ref(),
+//                 main_rpc_for_task.clone(),
+//             )
+//             .await
+//             {
+//                 Ok(data) => {
+//                     info!(
+//                         "Successfully loaded pool data for mint: {} (Raydium: {}, Pump: {}, Whirlpool: {})",
+//                         mint,
+//                         data.raydium_pools.len(),
+//                         data.pump_pools.len(),
+//                         data.whirlpool_pools.len()
+//                     );
+//                     data
+//                 }
+//                 Err(e) => {
+//                     error!("Failed to initialize pool data for mint {}: {}", mint, e);
+//                     return;
+//                 }
+//             };
+
+//             // Load address lookup tables if configured
+//             // Note: Address lookup tables are optional and can be empty
+//             // The transaction builder will work without them, but they help reduce transaction size
+//             let address_lookup_tables = vec![];
+
+//             // Trading loop
+//             info!("Starting trading loop for mint: {}", mint);
+//             loop {
+//                 // Fetch latest blockhash
+//                 let blockhash = match main_rpc_for_task.get_latest_blockhash() {
+//                     Ok(hash) => hash,
+//                     Err(e) => {
+//                         error!("Failed to fetch latest blockhash: {}", e);
+//                         tokio::time::sleep(tokio::time::Duration::from_millis(process_delay)).await;
+//                         continue;
+//                     }
+//                 };
+
+//                 // Build and send transaction
+//                 match build_and_send_transaction(
+//                     &wallet_kp,
+//                     &config_for_task,
+//                     &pool_data,
+//                     &rpc_clients_for_task,
+//                     blockhash,
+//                     &address_lookup_tables,
+//                 )
+//                 .await
+//                 {
+//                     Ok(signatures) => {
+//                         if !signatures.is_empty() {
+//                             info!(
+//                                 "Successfully sent {} transaction(s) for mint {}: {:?}",
+//                                 signatures.len(),
+//                                 mint,
+//                                 signatures
+//                             );
+//                         }
+//                     }
+//                     Err(e) => {
+//                         // Don't log every failed transaction as error to avoid spam
+//                         // Only log if it's a significant error
+//                         if e.to_string().contains("insufficient funds") {
+//                             error!("Insufficient funds for mint {}: {}", mint, e);
+//                         } else {
+//                             // Log at debug level for normal transaction failures
+//                             debug!("Transaction failed for mint {}: {}", mint, e);
+//                         }
+//                     }
+//                 }
+
+//                 // Wait before next iteration
+//                 tokio::time::sleep(tokio::time::Duration::from_millis(process_delay)).await;
+//             }
+//         });
+
+//         handles.push(handle);
+//     }
+
+//     info!("All trading tasks spawned. Bot is now running...");
+//     info!("Press Ctrl+C to stop the bot.");
+
+//     // Wait for all tasks (they run indefinitely)
+//     futures::future::join_all(handles).await;
+// }
