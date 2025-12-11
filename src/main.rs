@@ -42,7 +42,7 @@ async fn main() {
 
     // Initialize enhanced token fetcher
     let token_fetch_config = TokenFetchConfig {
-        max_retries: 3,
+        max_retries: 10,
         retry_delay_ms: 1000,
         batch_size: 10,
         timeout_seconds: 30,

@@ -1,8 +1,10 @@
 use crate::chain::pools::{MintPoolData, PumpPool, RaydiumPool};
+use crate::chain::constants::SOL_MINT;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use solana_sdk::pubkey::Pubkey;
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 /// Token price information
@@ -323,36 +325,70 @@ impl MarketDataFetcher {
 
         println!("dex_prices: {:?}", dex_prices);
         println!("-------\n");
-        if dex_prices.len() >= 2 {
-            // Find best buy and sell prices
-            let (best_buy_dex, best_buy_price) = dex_prices
-                .iter()
-                .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap();
+        
+        // Filter out invalid prices before comparison
+        let sol_mint_pubkey = Pubkey::from_str(SOL_MINT)?;
+        let is_wsol_token = pool_data.mint == sol_mint_pubkey;
+        
+        let valid_prices: HashMap<String, f64> = dex_prices
+            .iter()
+            .filter(|(_, &price)| {
+                // For WSOL, prices should be close to 1.0 (between 0.1 and 10.0)
+                // For other tokens, just check they're reasonable
+                if is_wsol_token {
+                    price >= 0.1 && price <= 10.0
+                } else {
+                    price > 0.0 && price < 1e12
+                }
+            })
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        
+        if valid_prices.len() < 2 {
+            warn!("Not enough valid prices for arbitrage (got {} valid out of {} total)", 
+                  valid_prices.len(), dex_prices.len());
+            return Ok(opportunities);
+        }
+        
+        // Find best buy and sell prices from valid prices only
+        let (best_buy_dex, best_buy_price) = valid_prices
+            .iter()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
 
-            let (best_sell_dex, best_sell_price) = dex_prices
-                .iter()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap();  
+        let (best_sell_dex, best_sell_price) = valid_prices
+            .iter()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();  
 
-            let price_spread = best_sell_price - best_buy_price;
-            let potential_profit_percent = (price_spread / best_buy_price) * 100.0;
-            println!("potential_profit_percent: {:?}", potential_profit_percent);
+        let price_spread = best_sell_price - best_buy_price;
+        let potential_profit_percent = (price_spread / best_buy_price) * 100.0;
+        println!("potential_profit_percent: {:?}", potential_profit_percent);
 
-            // Only consider opportunities with significant spread
-            if potential_profit_percent > 0.5 {
-                opportunities.push(PriceComparison {
-                    token_mint: token_mint.clone(),
-                    dex_prices: dex_prices.clone(),
-                    best_buy_price: *best_buy_price,
-                    best_sell_price: *best_sell_price,
-                    best_buy_dex: best_buy_dex.clone(),
-                    best_sell_dex: best_sell_dex.clone(),
-                    price_spread,
-                    potential_profit_percent,
-                    timestamp: Instant::now(),
-                });
+        // Additional validation: for WSOL, spreads > 50% are likely calculation errors
+        // For other tokens, we'll use the 0.5% threshold
+        let min_profit_threshold = if is_wsol_token { 5.0 } else { 0.5 };
+        
+        // Only consider opportunities with significant spread
+        if potential_profit_percent > min_profit_threshold {
+            // For WSOL, if the spread is still very large after validation, it's likely an error
+            if is_wsol_token && potential_profit_percent > 50.0 {
+                warn!("WSOL arbitrage opportunity with {}% profit seems too good to be true. Skipping.", 
+                      potential_profit_percent);
+                return Ok(opportunities);
             }
+            
+            opportunities.push(PriceComparison {
+                token_mint: token_mint.clone(),
+                dex_prices: valid_prices.clone(),
+                best_buy_price: *best_buy_price,
+                best_sell_price: *best_sell_price,
+                best_buy_dex: best_buy_dex.clone(),
+                best_sell_dex: best_sell_dex.clone(),
+                price_spread,
+                potential_profit_percent,
+                timestamp: Instant::now(),
+            });
         }
 
         Ok(opportunities)
@@ -360,6 +396,9 @@ impl MarketDataFetcher {
 
     /// Calculate price from Raydium pool
     async fn calculate_raydium_price(&self, pool: &RaydiumPool) -> Result<f64> {
+        let sol_mint_pubkey = Pubkey::from_str(SOL_MINT)?;
+        let is_wsol_pool = pool.token_mint == sol_mint_pubkey || pool.base_mint == sol_mint_pubkey;
+
         // Fetch token account balances using RPC client (handles parsing automatically)
         let token_balance = self.rpc_client
             .get_token_account_balance(&pool.token_vault)
@@ -382,15 +421,43 @@ impl MarketDataFetcher {
             return Err(anyhow!("Token reserve is zero, cannot calculate price"));
         }
 
+        if sol_amount == 0.0 {
+            return Err(anyhow!("SOL reserve is zero, cannot calculate price"));
+        }
+
         // Calculate price: price = sol_amount / token_amount
         // This gives us the price of 1 token in SOL
-        let price = sol_amount / token_amount;
+        let mut price = sol_amount / token_amount;
+
+        // For WSOL pools, validate and cap the price (WSOL should be ~1:1 with SOL)
+        if is_wsol_pool {
+            // If price is way off (more than 10x difference), the vaults might be swapped
+            // or there's a calculation error - try the inverse
+            if price > 10.0 || price < 0.1 {
+                warn!("Raydium WSOL pool price seems inverted: {}. Trying inverse calculation.", price);
+                price = token_amount / sol_amount;
+            }
+            
+            // Cap WSOL price to reasonable range (0.5 to 2.0 SOL per WSOL)
+            if price > 2.0 || price < 0.5 {
+                warn!("Raydium WSOL pool price out of reasonable range: {}. Capping to 1.0", price);
+                price = 1.0;
+            }
+        }
+
+        // Validate price is reasonable for any token (not negative or zero, and not astronomical)
+        if price <= 0.0 || price > 1e12 {
+            return Err(anyhow!("Calculated price is invalid: {} SOL per token", price));
+        }
 
         Ok(price)
     }
 
     /// Calculate price from Pump pool
     async fn calculate_pump_price(&self, pool: &PumpPool) -> Result<f64> {
+        let sol_mint_pubkey = Pubkey::from_str(SOL_MINT)?;
+        let is_wsol_pool = pool.token_mint == sol_mint_pubkey || pool.base_mint == sol_mint_pubkey;
+
         // Fetch token account balances using RPC client (handles parsing automatically)
         let token_balance = self.rpc_client
             .get_token_account_balance(&pool.token_vault)
@@ -413,9 +480,34 @@ impl MarketDataFetcher {
             return Err(anyhow!("Token reserve is zero, cannot calculate price"));
         }
 
+        if sol_amount == 0.0 {
+            return Err(anyhow!("SOL reserve is zero, cannot calculate price"));
+        }
+
         // Calculate price: price = sol_amount / token_amount
         // This gives us the price of 1 token in SOL
-        let price = sol_amount / token_amount;
+        let mut price = sol_amount / token_amount;
+
+        // For WSOL pools, validate and cap the price (WSOL should be ~1:1 with SOL)
+        if is_wsol_pool {
+            // If price is way off (more than 10x difference), the vaults might be swapped
+            // or there's a calculation error - try the inverse
+            if price > 10.0 || price < 0.1 {
+                warn!("Pump WSOL pool price seems inverted: {}. Trying inverse calculation.", price);
+                price = token_amount / sol_amount;
+            }
+            
+            // Cap WSOL price to reasonable range (0.5 to 2.0 SOL per WSOL)
+            if price > 2.0 || price < 0.5 {
+                warn!("Pump WSOL pool price out of reasonable range: {}. Capping to 1.0", price);
+                price = 1.0;
+            }
+        }
+
+        // Validate price is reasonable for any token (not negative or zero, and not astronomical)
+        if price <= 0.0 || price > 1e12 {
+            return Err(anyhow!("Calculated price is invalid: {} SOL per token", price));
+        }
 
         Ok(price)
     }
