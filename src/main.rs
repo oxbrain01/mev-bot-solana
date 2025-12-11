@@ -98,17 +98,25 @@ async fn main() {
                         println!("Failed to fetch token price: {}", e);
                     }
                 }
+                println!("-------\n");
+                println!("pool_data: {:?}", pool_data);
+                println!("-------\n");
 
                 // Calculate arbitrage opportunities
                 match market_fetcher
                     .calculate_arbitrage_opportunities(&pool_data)
                     .await
                 {
+            
                     Ok(opportunities) => {
+                                println!("opportunities: {:?}", opportunities);
                         if opportunities.is_empty() {
                             println!("No significant arbitrage opportunities found");
                         } else {
                             println!("Found {} arbitrage opportunities:", opportunities.len());
+                            println!(
+                                "opportunities: {:?}", opportunities
+                            );
                             for (i, opp) in opportunities.iter().enumerate() {
                                 println!(
                                     "  {}. {}: Buy on {} at {:.6}, Sell on {} at {:.6} ({}% profit)",

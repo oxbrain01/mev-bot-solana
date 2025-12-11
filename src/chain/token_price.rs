@@ -60,6 +60,9 @@ impl MarketDataFetcher {
             }
         }
 
+        println!("Fetching price for mint: {}", mint);
+        println!("-------\n");
+
         // Try multiple price sources
         let mut price_sources = Vec::new();
 
@@ -68,23 +71,37 @@ impl MarketDataFetcher {
             price_sources.push(price);
         }
 
-        // Try Birdeye API
-        if let Ok(price) = self.fetch_birdeye_price(mint).await {
-            price_sources.push(price);
-        }
+        // println!("Price sources after Jupiter: {:?}", price_sources);
+        //         println!("-------\n");
+
+        // // Try Birdeye API
+        // if let Ok(price) = self.fetch_birdeye_price(mint).await {
+        //     price_sources.push(price);
+        // }
+
+        // println!("Price sources after Birdeye: {:?}", price_sources);
+        //         println!("-------\n");
 
         // Try CoinGecko API
-        if let Ok(price) = self.fetch_coingecko_price(mint).await {
-            price_sources.push(price);
-        }
+        // if let Ok(price) = self.fetch_coingecko_price(mint).await {
+        //     price_sources.push(price);
+        // }
 
-        if price_sources.is_empty() {
-            return Err(anyhow!("Failed to fetch price from any source for mint: {}", mint));
-        }
+        // println!("Price sources after CoinGecko: {:?}", price_sources);
+        //         println!("-------\n");
+
+        // if price_sources.is_empty() {
+        //     return Err(anyhow!("Failed to fetch price from any source for mint: {}", mint));
+        // }
+
+        // println!("Price sources after all sources: {:?}", price_sources);
+        //         println!("-------\n");
 
         // Use the most recent price or average of recent prices
         let best_price = self.select_best_price(price_sources);
-        
+
+        // println!("Best price: {:?}", best_price);
+        //         println!("-------\n");
         // Cache the result
         self.price_cache.insert(mint.to_string(), best_price.clone());
         
@@ -94,30 +111,40 @@ impl MarketDataFetcher {
     /// Fetch price from Jupiter API
     async fn fetch_jupiter_price(&self, mint: &str) -> Result<TokenPrice> {
         let url = format!(
-            "https://price.jup.ag/v4/price?ids={}",
+            "https://api.jup.ag/price/v3?ids={}",
             mint
         );
 
-        let response = reqwest::get(&url).await?;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&url)
+            .header("x-api-key", "acfcdaea-caf7-4ff2-800c-3feb23e697ac")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Jupiter API request failed with status: {}", response.status()));
+        }
+
         let data: serde_json::Value = response.json().await?;
 
-        if let Some(price_data) = data.get("data").and_then(|d| d.get(mint)) {
+        // According to API docs, response is directly an object with token ID as key
+        if let Some(price_data) = data.get(mint) {
             let price_usd = price_data
-                .get("price")
+                .get("usdPrice")
                 .and_then(|p| p.as_f64())
-                .ok_or_else(|| anyhow!("Invalid price format"))?;
+                .ok_or_else(|| anyhow!("Invalid price format: missing usdPrice"))?;
 
-            let price_sol = price_data
-                .get("price_sol")
-                .and_then(|p| p.as_f64())
-                .unwrap_or(price_usd / 100.0); // Rough SOL/USD conversion
+            // Fetch SOL price to calculate price_sol accurately
+            let sol_price_usd = self.get_sol_price_usd().await.unwrap_or(150.0); // Default fallback
+            let price_sol = price_usd / sol_price_usd;
 
             Ok(TokenPrice {
                 mint: mint.to_string(),
                 price_usd,
                 price_sol,
-                volume_24h: 0.0, // Jupiter doesn't provide volume
-                market_cap: 0.0, // Jupiter doesn't provide market cap
+                volume_24h: 0.0, // Jupiter doesn't provide volume in this endpoint
+                market_cap: 0.0, // Jupiter doesn't provide market cap in this endpoint
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -125,8 +152,35 @@ impl MarketDataFetcher {
                 source: "jupiter".to_string(),
             })
         } else {
-            Err(anyhow!("Price not found in Jupiter response"))
+            Err(anyhow!("Price not found in Jupiter response for mint: {}", mint))
         }
+    }
+
+    /// Helper method to fetch SOL price in USD
+    async fn get_sol_price_usd(&self) -> Result<f64> {
+        let sol_mint = "So11111111111111111111111111111111111111112";
+        let url = format!(
+            "https://api.jup.ag/price/v3?ids={}",
+            sol_mint
+        );
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&url)
+            .header("x-api-key", "acfcdaea-caf7-4ff2-800c-3feb23e697ac")
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: serde_json::Value = response.json().await?;
+            if let Some(sol_data) = data.get(sol_mint) {
+                if let Some(price) = sol_data.get("usdPrice").and_then(|p| p.as_f64()) {
+                    return Ok(price);
+                }
+            }
+        }
+        
+        Err(anyhow!("Failed to fetch SOL price"))
     }
 
     /// Fetch price from Birdeye API
@@ -139,7 +193,7 @@ impl MarketDataFetcher {
         let client = reqwest::Client::new();
         let response = client
             .get(&url)
-            .header("X-API-KEY", "YOUR_BIRDEYE_API_KEY") // You'll need to get an API key
+            .header("X-API-KEY", "63535f47553c4e419438b9ada648abe9") // You'll need to get an API key
             .send()
             .await?;
 
@@ -267,6 +321,8 @@ impl MarketDataFetcher {
             }
         }
 
+        println!("dex_prices: {:?}", dex_prices);
+        println!("-------\n");
         if dex_prices.len() >= 2 {
             // Find best buy and sell prices
             let (best_buy_dex, best_buy_price) = dex_prices
@@ -277,10 +333,11 @@ impl MarketDataFetcher {
             let (best_sell_dex, best_sell_price) = dex_prices
                 .iter()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap();
+                .unwrap();  
 
             let price_spread = best_sell_price - best_buy_price;
             let potential_profit_percent = (price_spread / best_buy_price) * 100.0;
+            println!("potential_profit_percent: {:?}", potential_profit_percent);
 
             // Only consider opportunities with significant spread
             if potential_profit_percent > 0.5 {
@@ -302,21 +359,65 @@ impl MarketDataFetcher {
     }
 
     /// Calculate price from Raydium pool
-    async fn calculate_raydium_price(&self, _pool: &RaydiumPool) -> Result<f64> {
-        // This is a simplified calculation
-        // In a real implementation, you would:
-        // 1. Fetch the current reserves from the vaults
-        // 2. Calculate the price based on the AMM formula
-        // 3. Consider fees and slippage
+    async fn calculate_raydium_price(&self, pool: &RaydiumPool) -> Result<f64> {
+        // Fetch token account balances using RPC client (handles parsing automatically)
+        let token_balance = self.rpc_client
+            .get_token_account_balance(&pool.token_vault)
+            .map_err(|e| anyhow!("Failed to fetch token vault balance: {}", e))?;
+        
+        let sol_balance = self.rpc_client
+            .get_token_account_balance(&pool.sol_vault)
+            .map_err(|e| anyhow!("Failed to fetch SOL vault balance: {}", e))?;
 
-        // For now, return a placeholder price
-        Ok(1.0) // Placeholder
+        // Parse amounts from UI strings (e.g., "1000.5" -> 1000.5)
+        let token_amount: f64 = token_balance.amount.parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse token balance: {}", e))?
+            as f64 / 10_f64.powi(token_balance.decimals as i32);
+        
+        let sol_amount: f64 = sol_balance.amount.parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse SOL balance: {}", e))?
+            as f64 / 10_f64.powi(sol_balance.decimals as i32);
+
+        if token_amount == 0.0 {
+            return Err(anyhow!("Token reserve is zero, cannot calculate price"));
+        }
+
+        // Calculate price: price = sol_amount / token_amount
+        // This gives us the price of 1 token in SOL
+        let price = sol_amount / token_amount;
+
+        Ok(price)
     }
 
     /// Calculate price from Pump pool
-    async fn calculate_pump_price(&self, _pool: &PumpPool) -> Result<f64> {
-        // Similar to Raydium calculation
-        Ok(1.0) // Placeholder
+    async fn calculate_pump_price(&self, pool: &PumpPool) -> Result<f64> {
+        // Fetch token account balances using RPC client (handles parsing automatically)
+        let token_balance = self.rpc_client
+            .get_token_account_balance(&pool.token_vault)
+            .map_err(|e| anyhow!("Failed to fetch token vault balance: {}", e))?;
+        
+        let sol_balance = self.rpc_client
+            .get_token_account_balance(&pool.sol_vault)
+            .map_err(|e| anyhow!("Failed to fetch SOL vault balance: {}", e))?;
+
+        // Parse amounts from UI strings (e.g., "1000.5" -> 1000.5)
+        let token_amount: f64 = token_balance.amount.parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse token balance: {}", e))?
+            as f64 / 10_f64.powi(token_balance.decimals as i32);
+        
+        let sol_amount: f64 = sol_balance.amount.parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse SOL balance: {}", e))?
+            as f64 / 10_f64.powi(sol_balance.decimals as i32);
+
+        if token_amount == 0.0 {
+            return Err(anyhow!("Token reserve is zero, cannot calculate price"));
+        }
+
+        // Calculate price: price = sol_amount / token_amount
+        // This gives us the price of 1 token in SOL
+        let price = sol_amount / token_amount;
+
+        Ok(price)
     }
 
     /// Get market statistics
