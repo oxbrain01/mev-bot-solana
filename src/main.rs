@@ -1,7 +1,7 @@
 use solana_mev_bot::{
     chain::{
         token_fetch::{TokenFetchConfig, TokenFetcher},
-        token_price::{MarketDataFetcher, PriceMonitor},
+        token_price::MarketDataFetcher,
     },
     config::Config,
 };
@@ -54,9 +54,6 @@ async fn main() {
 
     // Initialize market data fetcher
     let mut market_fetcher = MarketDataFetcher::new(rpc_client.clone());
-
-    // Initialize price monitor
-    let mut price_monitor = PriceMonitor::new(rpc_client, 5000, 0.5); // 5 second intervals, 0.5% threshold
 
     // Process each mint configuration
     for mint_config in &config.routing.mint_config_list {
@@ -142,17 +139,74 @@ async fn main() {
         }
     }
 
-    // Start price monitoring (this would run indefinitely in a real bot)
-    println!("\nStarting price monitoring...");
-    let mints: Vec<String> = config
-        .routing
-        .mint_config_list
-        .iter()
-        .map(|mc| mc.mint.clone())
-        .collect();
-
-    // Uncomment the following line to start continuous price monitoring
-     price_monitor.start_monitoring(mints).await;
+    // Start continuous arbitrage opportunity monitoring
+    println!("\nStarting continuous arbitrage opportunity monitoring...");
+    println!("Monitoring interval: 2 seconds");
+    println!("Price threshold: 0.5% minimum profit");
+    
+    // Monitoring interval - check for opportunities every 2 seconds
+    let monitoring_interval_ms = 2000u64; // 2 seconds
+    
+    loop {
+        for mint_config in &config.routing.mint_config_list {
+            // Fetch fresh pool data
+            match token_fetcher
+                .initialize_pool_data(
+                    &mint_config.mint,
+                    &wallet_address,
+                    mint_config.raydium_pool_list.as_ref(),
+                    mint_config.raydium_cp_pool_list.as_ref(),
+                    mint_config.pump_pool_list.as_ref(),
+                    mint_config.meteora_dlmm_pool_list.as_ref(),
+                    mint_config.whirlpool_pool_list.as_ref(),
+                    mint_config.raydium_clmm_pool_list.as_ref(),
+                    mint_config.meteora_damm_pool_list.as_ref(),
+                    mint_config.solfi_pool_list.as_ref(),
+                    mint_config.meteora_damm_v2_pool_list.as_ref(),
+                    mint_config.vertigo_pool_list.as_ref(),
+                )
+                .await
+            {
+                Ok(pool_data) => {
+                    // Calculate arbitrage opportunities
+                    match market_fetcher
+                        .calculate_arbitrage_opportunities(&pool_data)
+                        .await
+                    {
+                        Ok(opportunities) => {
+                            if !opportunities.is_empty() {
+                                println!("\n✓ Found {} arbitrage opportunities for {}:",
+                                    opportunities.len(),
+                                    mint_config.mint
+                                );
+                                for (i, opp) in opportunities.iter().enumerate() {
+                                    println!(
+                                        "  {}. {}: Buy on {} at {:.6}, Sell on {} at {:.6} ({:.2}% profit)",
+                                        i + 1,
+                                        opp.token_mint,
+                                        opp.best_buy_dex,
+                                        opp.best_buy_price,
+                                        opp.best_sell_dex,
+                                        opp.best_sell_price,
+                                        opp.potential_profit_percent
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to calculate arbitrage opportunities: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to load pool data for mint {}: {}", mint_config.mint, e);
+                }
+            }
+        }
+        
+        // Wait before next monitoring cycle
+        tokio::time::sleep(tokio::time::Duration::from_millis(monitoring_interval_ms)).await;
+    }
 
     println!("Enhanced token fetch logic demonstration completed!");
     println!("The bot is now ready for production use with improved error handling, caching, and retry logic.");
